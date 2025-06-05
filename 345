@@ -1,0 +1,98 @@
+from aiogram import types
+from aiogram.dispatcher.filters import Text
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import SUPPORT_CHAT_ID
+from db_logic.base import SupportTickets
+from utils.storage import JSONStorage
+from loader import dp
+from states import SupportState
+
+# Обработчик новых участников чата
+@dp.message_handler(content_types=types.ContentType.NEW_CHAT_MEMBERS)
+async def new_chat_member(message: types.Message):
+    await message.reply(f"ID чата: {message.chat.id}\nБота нужно сделать администратором!")
+
+# Обработчик ответов админа в чате поддержки
+@dp.message_handler(chat_id=SUPPORT_CHAT_ID, content_types=types.ContentType.ANY)
+async def support_admin_reply(message: types.Message):
+    # Игнорируем системные сообщения форума
+    if message.content_type in [
+        types.ContentType.FORUM_TOPIC_CREATED,
+        types.ContentType.FORUM_TOPIC_EDITED,
+        types.ContentType.FORUM_TOPIC_CLOSED,
+    ]:
+        return
+    
+    message_thread_id = message.message_thread_id
+    ticket = SupportTickets().get_ticket_by_message_thread_id(message_thread_id)
+    
+    if not ticket:
+        await message.reply("Тикет не найден")
+        return
+    
+    # Устанавливаем состояние пользователя
+    user_state = dp.current_state(chat=ticket.tg_id, user=ticket.tg_id)
+    await user_state.set_state(SupportState.in_support)
+    await user_state.update_data(message_thread_id=message_thread_id)
+    
+    # Пересылаем сообщение пользователю
+    try:
+        if message.content_type == types.ContentType.PHOTO:
+            await dp.bot.send_photo(
+                chat_id=ticket.tg_id,
+                photo=message.photo[-1].file_id,
+                caption=f"🌄 Фото от менеджера: {message.caption}" if message.caption else "🌄 Фото от менеджера"
+            )
+        elif message.content_type == types.ContentType.VIDEO:
+            await dp.bot.send_video(
+                chat_id=ticket.tg_id,
+                video=message.video.file_id,
+                caption=f"🎥 Видео от менеджера: {message.caption}" if message.caption else "🎥 Видео от менеджера"
+            )
+        else:
+            await dp.bot.send_message(
+                chat_id=ticket.tg_id,
+                text=f"👁️ Сообщение от менеджера: {message.text}"
+            )
+    except Exception as e:
+        await message.answer(f"Ошибка доставки: {e}")
+
+# Обработчик действий с тикетом
+@dp.callback_query_handler(Text(startswith="ticket_action:"), state="*")
+async def handle_ticket_actions(call: types.CallbackQuery):
+    action = call.data.split(":")[1]
+    message_thread_id = call.message.message_thread_id
+    
+    ticket = SupportTickets().get_ticket_by_message_thread_id(message_thread_id)
+    if not ticket:
+        await call.answer("Тикет не найден")
+        return
+    
+    # Блокировка пользователя при необходимости
+    if action == "block":
+        JSONStorage.block_user(ticket.tg_id)
+        block_text = " + пользователь заблокирован"
+    else:
+        block_text = ""
+    
+    # Уведомление пользователя
+    await dp.bot.send_message(
+        chat_id=ticket.tg_id,
+        text=f"🔒 Ваш тикет закрыт{' (вы заблокированы)' if action == 'block' else ''}"
+    )
+    
+    # Закрытие состояния
+    user_state = dp.current_state(chat=ticket.tg_id, user=ticket.tg_id)
+    await user_state.finish()
+    
+    # Удаление топика
+    await dp.bot.delete_forum_topic(
+        chat_id=SUPPORT_CHAT_ID,
+        message_thread_id=message_thread_id
+    )
+    
+    # Удаление тикета из БД
+    SupportTickets().delete_ticket(message_thread_id)
+    
+    await call.answer(f"Тикет закрыт{block_text}")
+    await call.message.delete()
